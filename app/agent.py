@@ -1,0 +1,346 @@
+"""
+WhatsApp Agent — Central orchestrator that ties everything together.
+
+Routes incoming questions to the right data source:
+  1. PDF RAG pipeline (vector similarity search)
+  2. Database queries (conversation history, user data)
+  3. MCP tools (external systems, APIs, databases, data files)
+
+Uses an LLM to decide the best source and format the response.
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import Optional
+
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from app.config import settings
+from app.pdf_rag import PDFRagPipeline
+from app.database import DatabaseManager
+from app.mcp_manager import MCPManager
+
+logger = logging.getLogger(__name__)
+
+
+def create_llm():
+    """Create the LLM instance based on configuration."""
+    if settings.llm_provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+
+        return ChatAnthropic(
+            model="claude-3-5-sonnet-20241022",
+            api_key=settings.anthropic_api_key,
+            max_tokens=1024,
+        )
+    else:
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model="gpt-4o-mini",
+            api_key=settings.openai_api_key,
+            max_tokens=1024,
+        )
+
+
+class WhatsAppAgent:
+    """
+    The main agent that orchestrates all data sources and
+    responds to WhatsApp messages.
+    """
+
+    def __init__(self):
+        # Core components
+        self.llm = create_llm()
+        self.rag_pipeline = PDFRagPipeline()
+        self.db = DatabaseManager()
+        self.mcp = MCPManager()  # Manages ALL MCP servers
+
+        # State
+        self.initialized = False
+
+    # ── Initialization ────────────────────────────────────────────
+    async def initialize(self):
+        """Initialize all components on startup."""
+        logger.info("Initializing WhatsApp Agent...")
+
+        # 1. Initialize database
+        await self.db.init_db()
+        logger.info("✅ Database initialized")
+
+        # 2. Load or create vector store
+        existing = self.rag_pipeline.load_existing_vectorstore()
+        if existing:
+            self.rag_pipeline.build_qa_chain(self.llm)
+            logger.info("✅ Loaded existing PDF vector store")
+        else:
+            count = self.rag_pipeline.ingest()
+            if count > 0:
+                self.rag_pipeline.build_qa_chain(self.llm)
+                logger.info(f"✅ Ingested {count} PDF chunks")
+            else:
+                logger.info("⚠️  No PDFs found — RAG pipeline empty (add PDFs later)")
+
+        # 3. Connect to all configured MCP servers
+        await self.mcp.initialize()
+        if self.mcp.connected_count > 0:
+            logger.info(
+                f"✅ {self.mcp.connected_count} MCP servers connected, "
+                f"{self.mcp.total_tools} tools available"
+            )
+        else:
+            logger.info("⚠️  No MCP servers connected (check mcp_config.json)")
+
+        self.initialized = True
+        logger.info("🚀 WhatsApp Agent initialized successfully!")
+
+    async def shutdown(self):
+        """Clean shutdown of all components."""
+        await self.mcp.shutdown()
+        await self.db.close()
+        logger.info("Agent shut down cleanly")
+
+    # ── Restaurant Personality System Prompt ─────────────────────
+    RESTAURANT_SYSTEM_PROMPT = """أنت "أبو طبق" — مساعد مطعم أبو طبق الذكي على واتساب!
+
+شخصيتك:
+- نادل ودود وظريف يحب الفكاهة العربية الأصيلة
+- تتكلم بالعربية الفصحى المحكية بدفء وحيوية
+- دائماً تُدخل البهجة على قلب الزبون قبل الطعام على معدته
+- تستخدم الإيموجي بذكاء لكن بدون إسراف
+- ردودك قصيرة ومضحكة ومفيدة — مثل النادل الماهر تماماً
+
+مهامك الأساسية:
+1. عرض قائمة الطعام وأسعارها بوضوح
+2. شرح تفاصيل كل طبق وإضافة لمسة فكاهية
+3. تقديم توصيات شخصية حسب رغبة الزبون
+4. الإجابة عن استفسارات المكونات والحساسية والسعرات
+5. إعلام الزبائن بعروض اليوم
+
+قواعد الرد:
+- إذا سأل الزبون عن طبق → اعطه السعر + وصف + حقيقة ظريفة
+- إذا طلب توصية → اسأله: نباتي؟ حار؟ عائلة؟ → ثم قدّم الأنسب
+- إذا سأل عن العرض → أخبره بعرض اليوم مع نكتة خفيفة
+- دائماً اختم ردك بجملة تشجع على الطلب أو تُضحك
+- لا تُطوّل — الزبون جائع وعنده صبر محدود!
+
+أمثلة على نبرتك:
+- "هذه الكبسة تجعل الجيران يطرقون بابك!"
+- "الكنافة موجودة — وضميرك عليك أنت!"
+- "الشيف يقول السر في الكمية... نحن نقول السر في الجوع!"
+
+تذكر: أنت ممثل المطعم — كل رد يجب أن يجعل الزبون يبتسم ويطلب!"""
+
+    # ── Main Answer Pipeline ──────────────────────────────────────
+    async def answer(self, question: str, user_id: str = None) -> str:
+        """
+        Main entry point: answer a user's question using all available sources.
+
+        Pipeline:
+          1. Save the user message to conversation history
+          2. Get recent conversation context
+          3. Try MCP tools first (restaurant menu is the primary source)
+          4. Try PDF RAG (for any supplementary documents)
+          5. Fall back to restaurant-aware LLM response
+          6. Save the response to conversation history
+        """
+        if user_id:
+            await self.db.get_or_create_user(user_id)
+            await self.db.save_message(user_id, "user", question)
+
+        history = []
+        if user_id:
+            history = await self.db.get_conversation_history(user_id, limit=6)
+
+        answer_text = None
+        source = None
+
+        # ── Try MCP Tools (Restaurant Menu is priority) ───────────
+        if self.mcp.total_tools > 0:
+            try:
+                tools = self.mcp.list_all_tools()
+                if tools:
+                    answer_text = await self._query_mcp(question, tools)
+                    if answer_text:
+                        source = "mcp"
+            except Exception as e:
+                logger.error(f"MCP query failed: {e}")
+
+        # ── Try PDF RAG (supplementary documents) ─────────────────
+        if not answer_text and self.rag_pipeline.qa_chain:
+            try:
+                result = await self.rag_pipeline.query(question)
+                answer_text = result["answer"]
+                source = "pdf"
+
+                if "don't have that information" in answer_text.lower():
+                    answer_text = None
+                else:
+                    sources = result.get("sources", [])
+                    if sources:
+                        source_names = [Path(s).name for s in sources]
+                        answer_text += f"\n\n📄 _المصدر: {', '.join(source_names)}_"
+
+            except Exception as e:
+                logger.error(f"RAG query failed: {e}")
+
+        # ── Fallback: Restaurant-Aware LLM ────────────────────────
+        if not answer_text:
+            context = "\n".join(
+                f"{m['role']}: {m['content']}" for m in history[-4:]
+            )
+
+            messages = [
+                SystemMessage(content=self.RESTAURANT_SYSTEM_PROMPT),
+            ]
+            if context:
+                messages.append(
+                    SystemMessage(content=f"آخر رسائل الزبون:\n{context}")
+                )
+            messages.append(HumanMessage(content=question))
+
+            response = await self.llm.ainvoke(messages)
+            answer_text = response.content
+            source = "llm"
+
+        if user_id and answer_text:
+            await self.db.save_message(user_id, "assistant", answer_text, source)
+
+        return answer_text
+
+    # ── MCP Tool Routing (Smart tool selection via LLM) ───────────
+    async def _query_mcp(self, question: str, tools: list[dict]) -> Optional[str]:
+        """
+        Use LLM to pick the right MCP tool and generate arguments.
+        Supports multi-step tool calls (e.g., list tables → query).
+        """
+        tool_descriptions = "\n".join(
+            f"- {t['name']}: {t['description']}" for t in tools
+        )
+
+        # Step 1: Pick the tool and generate arguments
+        messages = [
+            SystemMessage(
+                content=(
+                    f"أنت موجّه أدوات ذكي لمطعم أبو طبق. الأدوات المتاحة:\n\n"
+                    f"{tool_descriptions}\n\n"
+                    "بناءً على سؤال الزبون، أجب بـ JSON فقط:\n"
+                    '{"tool": "tool_name", "arguments": {"param": "value"}}\n\n'
+                    "أو NONE إذا لا توجد أداة مناسبة.\n\n"
+                    "أنماط شائعة للمطعم:\n"
+                    '- سؤال عن القائمة الكاملة → {{"tool": "get_full_menu", "arguments": {{}}}}\n'
+                    '- سؤال عن قسم (مقبلات/مشويات...) → {{"tool": "get_category_menu", "arguments": {{"category": "starters"}}}}\n'
+                    '- سؤال عن طبق محدد → {{"tool": "get_dish_details", "arguments": {{"dish_name": "اسم الطبق"}}}}\n'
+                    '- بحث عن مكون أو كلمة → {{"tool": "search_menu", "arguments": {{"keyword": "كلمة البحث"}}}}\n'
+                    '- طلب توصية → {{"tool": "get_recommendations", "arguments": {{"preference": "chef_picks"}}}}\n'
+                    '- سؤال عن العروض → {{"tool": "get_daily_specials", "arguments": {{}}}}\n'
+                    '- سؤال عن المطعم → {{"tool": "get_restaurant_info", "arguments": {{}}}}\n'
+                    '- قاعدة البيانات → {{"tool": "query", "arguments": {{"sql": "SELECT ..."}}}}\n'
+                    "أخرج JSON أو NONE فقط، لا شيء آخر."
+                )
+            ),
+            HumanMessage(content=question),
+        ]
+
+        response = await self.llm.ainvoke(messages)
+        response_text = response.content.strip()
+
+        if response_text == "NONE":
+            return None
+
+        # Parse the LLM's tool selection
+        try:
+            # Handle markdown code blocks
+            if "```" in response_text:
+                response_text = response_text.split("```")[1]
+                if response_text.startswith("json"):
+                    response_text = response_text[4:]
+
+            tool_call = json.loads(response_text)
+            tool_name = tool_call["tool"]
+            arguments = tool_call.get("arguments", {})
+        except (json.JSONDecodeError, KeyError):
+            # Fallback: treat response as just a tool name
+            tool_name = response_text.strip()
+            arguments = {"query": question}
+
+        # Step 2: Call the tool via MCP manager
+        try:
+            result = await self.mcp.call_tool(tool_name, arguments)
+
+            # Step 3: Summarize the result for WhatsApp
+            summary = await self._summarize_for_whatsapp(question, tool_name, result)
+            return summary
+
+        except Exception as e:
+            logger.error(f"MCP tool call failed ({tool_name}): {e}")
+            return None
+
+    async def _summarize_for_whatsapp(
+        self, question: str, tool_name: str, raw_result: str
+    ) -> str:
+        """Use LLM to format MCP tool output for WhatsApp with restaurant personality."""
+        # Restaurant tools already return well-formatted Arabic text — return directly
+        restaurant_tools = {
+            "get_full_menu", "get_category_menu", "get_dish_details",
+            "search_menu", "get_recommendations", "get_daily_specials",
+            "get_restaurant_info",
+        }
+        if tool_name in restaurant_tools:
+            return raw_result
+
+        # For other tools (DB, CSV...) summarize with restaurant persona
+        messages = [
+            SystemMessage(
+                content=(
+                    f"{self.RESTAURANT_SYSTEM_PROMPT}\n\n"
+                    "قم بتلخيص نتيجة الأداة التالية للإجابة على سؤال الزبون. "
+                    "اجعل الرد مختصراً وودياً ومناسباً للواتساب. "
+                    "استخدم التنسيق: عريض بـ * وقوائم بـ •"
+                )
+            ),
+            HumanMessage(
+                content=(
+                    f"سؤال الزبون: {question}\n\n"
+                    f"الأداة: {tool_name}\n"
+                    f"النتيجة:\n{raw_result[:2000]}"
+                )
+            ),
+        ]
+
+        response = await self.llm.ainvoke(messages)
+        return response.content
+
+    # ── Status & Utility ──────────────────────────────────────────
+    async def get_status(self) -> str:
+        """Get a formatted status message."""
+        stats = await self.db.get_stats()
+        rag_status = "✅ Active" if self.rag_pipeline.qa_chain else "❌ No PDFs"
+
+        # MCP status details
+        mcp_status_parts = []
+        mcp_info = self.mcp.get_status()
+        for name, info in mcp_info.items():
+            status = "✅" if info["connected"] else "❌"
+            mcp_status_parts.append(f"  {status} {name}: {info['tools']} tools")
+
+        mcp_text = "\n".join(mcp_status_parts) if mcp_status_parts else "  ⚪ None configured"
+
+        return (
+            f"*System Status*\n\n"
+            f"📚 PDF RAG: {rag_status}\n"
+            f"🗄️ Database: ✅ Active\n"
+            f"🔌 MCP Servers:\n{mcp_text}\n\n"
+            f"👥 Users: {stats['users']}\n"
+            f"💬 Messages: {stats['messages']}\n"
+            f"📄 Documents: {stats['documents']}\n"
+            f"🛠️ Total MCP Tools: {self.mcp.total_tools}"
+        )
+
+    def get_pdf_sources(self) -> list[str]:
+        """List PDF files in the pdfs directory."""
+        pdf_dir = Path(self.rag_pipeline.pdf_dir)
+        if not pdf_dir.exists():
+            return []
+        return [f.name for f in pdf_dir.glob("**/*.pdf")]

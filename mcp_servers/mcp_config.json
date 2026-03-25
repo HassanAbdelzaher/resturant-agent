@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "restaurant": {
+      "command": "python",
+      "args": ["mcp_servers/restaurant_mcp.py", "--menu-path", "./data/restaurant_menu.json"],
+      "description": "Restaurant menu: dishes, prices, categories, recommendations, daily specials",
+      "enabled": true
+    }
+  }
+}
