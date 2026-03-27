@@ -16,8 +16,11 @@ GreenAPI REST API:
   Body: {"chatId": "79001234567@c.us", "message": "..."}
 """
 
+import asyncio
 import logging
 import tempfile
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +34,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# WhatsApp message character limit
+_WA_MAX_CHARS = 4096
 
 # ── Texts ─────────────────────────────────────────────────────────
 HELP_TEXT = """🍽️ *أهلاً في مطعم أبو طبق!*
@@ -55,6 +60,60 @@ _عندنا الأكل حلو والنكتة أحلى!_
 _ملاحظة: لا تتردد في السؤال — الجوع لا ينتظر!_ 😄"""
 
 
+# ── Message Deduplication ─────────────────────────────────────────
+class MessageDeduplicator:
+    """
+    Prevents processing the same GreenAPI message twice.
+    GreenAPI retries webhooks if it doesn't receive 200 quickly.
+    We keep a rolling window of recently seen message IDs.
+    """
+
+    def __init__(self, max_size: int = 500):
+        self._seen: set[str] = set()
+        self._order: deque[str] = deque(maxlen=max_size)
+        self._max_size = max_size
+
+    def is_duplicate(self, message_id: str) -> bool:
+        if message_id in self._seen:
+            return True
+        self._seen.add(message_id)
+        if len(self._order) == self._max_size:
+            oldest = self._order[0]
+            self._seen.discard(oldest)
+        self._order.append(message_id)
+        return False
+
+
+# ── Per-User Rate Limiter ─────────────────────────────────────────
+class RateLimiter:
+    """
+    Sliding-window rate limiter: tracks message timestamps per user
+    and rejects if they exceed rate_limit_per_minute.
+    """
+
+    def __init__(self, max_per_minute: int):
+        self._max = max_per_minute
+        self._windows: dict[str, deque[float]] = defaultdict(lambda: deque())
+
+    def is_allowed(self, user_id: str) -> bool:
+        if self._max == 0:
+            return True
+        now = time.monotonic()
+        window = self._windows[user_id]
+        cutoff = now - 60.0
+        while window and window[0] < cutoff:
+            window.popleft()
+        if len(window) >= self._max:
+            return False
+        window.append(now)
+        return True
+
+
+# Module-level singletons
+_deduplicator = MessageDeduplicator()
+_rate_limiter = RateLimiter(settings.rate_limit_per_minute)
+
+
 # ── GreenAPI Async Client ─────────────────────────────────────────
 class GreenAPIClient:
     """
@@ -73,15 +132,16 @@ class GreenAPIClient:
     def _url(self, method: str) -> str:
         return f"{self._base}/{method}/{self._token}"
 
-    async def send_text(self, chat_id: str, text: str) -> dict:
-        """Send a plain text message."""
+    async def send_text(self, chat_id: str, text: str) -> None:
+        """Send a plain text message, splitting if over WhatsApp's limit."""
+        chunks = _split_message(text)
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                self._url("sendMessage"),
-                json={"chatId": chat_id, "message": text},
-            )
-            resp.raise_for_status()
-            return resp.json()
+            for chunk in chunks:
+                resp = await client.post(
+                    self._url("sendMessage"),
+                    json={"chatId": chat_id, "message": chunk},
+                )
+                resp.raise_for_status()
 
     async def read_message(self, chat_id: str, id_message: str) -> None:
         """Mark a message as read (shows blue ticks to sender)."""
@@ -93,6 +153,17 @@ class GreenAPIClient:
                 )
         except Exception as exc:
             logger.debug(f"readChat failed (non-critical): {exc}")
+
+    async def show_typing(self, chat_id: str) -> None:
+        """Send a typing indicator to the chat."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    self._url("showTyping"),
+                    json={"chatId": chat_id},
+                )
+        except Exception as exc:
+            logger.debug(f"showTyping failed (non-critical): {exc}")
 
     async def download_file(self, download_url: str) -> bytes:
         """Download a media file from GreenAPI CDN."""
@@ -113,23 +184,62 @@ def get_client() -> GreenAPIClient:
     return _client
 
 
+# ── Message splitting ──────────────────────────────────────────────
+def _split_message(text: str, limit: int = _WA_MAX_CHARS) -> list[str]:
+    """
+    Split a long message into chunks at the nearest newline before `limit`.
+    Avoids cutting mid-word.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = text.rfind(" ", 0, limit)
+        if split_at == -1:
+            split_at = limit
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
+
+
 # ── Webhook payload helpers ───────────────────────────────────────
-def extract_message(payload: dict) -> tuple[str, str, str, dict]:
+def extract_message(payload: dict) -> tuple[str, str, str, dict, str]:
     """
     Parse a GreenAPI webhook payload.
 
     Returns:
-        chat_id    — "79001234567@c.us"
-        sender_id  — plain phone number used as user_id
-        msg_type   — "textMessage" | "documentMessage" | "imageMessage" | …
-        msg_data   — the messageData sub-dict
+        chat_id     — "79001234567@c.us"
+        sender_id   — plain phone number used as user_id
+        msg_type    — "textMessage" | "documentMessage" | "imageMessage" | …
+        msg_data    — the messageData sub-dict
+        sender_name — display name of the sender (may be empty)
     """
     sender_data = payload.get("senderData", {})
     chat_id = sender_data.get("chatId", "")
     sender_id = chat_id.replace("@c.us", "").replace("@g.us", "")
+    sender_name = sender_data.get("senderName", "") or sender_data.get("pushname", "")
     msg_data = payload.get("messageData", {})
     msg_type = msg_data.get("typeMessage", "unknown")
-    return chat_id, sender_id, msg_type, msg_data
+    return chat_id, sender_id, msg_type, msg_data, sender_name
+
+
+def _is_group_chat(chat_id: str) -> bool:
+    """Group chats use @g.us suffix; individual chats use @c.us."""
+    return chat_id.endswith("@g.us")
+
+
+def _is_admin(sender_id: str) -> bool:
+    """Check if sender is in the admin whitelist."""
+    admin_ids = settings.admin_ids_set
+    # If no admins configured, allow all (backwards-compatible default)
+    if not admin_ids:
+        return True
+    return sender_id in admin_ids
 
 
 # ── Route registration ────────────────────────────────────────────
@@ -140,8 +250,8 @@ def register_handlers(app: FastAPI, agent: "WhatsAppAgent") -> None:
     async def greenapi_webhook(request: Request) -> Response:
         """
         Receives all GreenAPI instance notifications.
-        Must return HTTP 200 quickly; heavy work is awaited inline
-        (GreenAPI retries if it doesn't get 200 within ~10 s).
+        Returns HTTP 200 immediately and processes the message in the background.
+        GreenAPI retries if it doesn't get 200 within ~10 s, so we must respond fast.
         """
         try:
             payload: dict[str, Any] = await request.json()
@@ -152,7 +262,13 @@ def register_handlers(app: FastAPI, agent: "WhatsAppAgent") -> None:
         logger.debug(f"GreenAPI webhook: {webhook_type}")
 
         if webhook_type == "incomingMessageReceived":
-            await _handle_incoming(payload, agent)
+            # Deduplicate before scheduling background work
+            message_id = payload.get("idMessage", "")
+            if message_id and _deduplicator.is_duplicate(message_id):
+                logger.debug(f"Duplicate message {message_id} — skipping")
+                return Response(status_code=200)
+            # Fire-and-forget: process in background, return 200 immediately
+            asyncio.create_task(_handle_incoming(payload, agent))
 
         # Always acknowledge — GreenAPI expects 200 for every notification
         return Response(status_code=200)
@@ -161,7 +277,7 @@ def register_handlers(app: FastAPI, agent: "WhatsAppAgent") -> None:
 # ── Incoming message dispatcher ───────────────────────────────────
 async def _handle_incoming(payload: dict, agent: "WhatsAppAgent") -> None:
     """Dispatch an incomingMessageReceived notification."""
-    chat_id, sender_id, msg_type, msg_data = extract_message(payload)
+    chat_id, sender_id, msg_type, msg_data, sender_name = extract_message(payload)
     id_message = payload.get("idMessage", "")
     client = get_client()
 
@@ -169,13 +285,18 @@ async def _handle_incoming(payload: dict, agent: "WhatsAppAgent") -> None:
         logger.warning("Received notification with no chatId — skipping")
         return
 
-    logger.info(f"Incoming [{msg_type}] from {sender_id}")
+    # Ignore group chats
+    if _is_group_chat(chat_id):
+        logger.debug(f"Ignoring group chat message from {chat_id}")
+        return
+
+    logger.info(f"Incoming [{msg_type}] from {sender_id} ({sender_name})")
 
     try:
         if msg_type == "textMessage":
             text = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
             await client.read_message(chat_id, id_message)
-            await _dispatch_text(chat_id, sender_id, text, agent)
+            await _dispatch_text(chat_id, sender_id, sender_name, text, agent)
 
         elif msg_type in ("documentMessage", "imageMessage", "videoMessage"):
             file_data = msg_data.get("fileMessageData", {})
@@ -198,7 +319,7 @@ async def _handle_incoming(payload: dict, agent: "WhatsAppAgent") -> None:
                 .strip()
             )
             await client.read_message(chat_id, id_message)
-            await _dispatch_text(chat_id, sender_id, text, agent)
+            await _dispatch_text(chat_id, sender_id, sender_name, text, agent)
 
         else:
             await client.send_text(
@@ -221,7 +342,7 @@ async def _handle_incoming(payload: dict, agent: "WhatsAppAgent") -> None:
 
 # ── Text message routing ──────────────────────────────────────────
 async def _dispatch_text(
-    chat_id: str, sender_id: str, text: str, agent: "WhatsAppAgent"
+    chat_id: str, sender_id: str, sender_name: str, text: str, agent: "WhatsAppAgent"
 ) -> None:
     """Route a text message to command handler or agent pipeline."""
     client = get_client()
@@ -234,54 +355,73 @@ async def _dispatch_text(
         )
         return
 
+    # Rate limit check
+    if not _rate_limiter.is_allowed(sender_id):
+        await client.send_text(
+            chat_id,
+            "⏳ أنت تراسلنا كثيراً! انتظر لحظة ثم حاول مرة أخرى 😅",
+        )
+        return
+
     if text.startswith("/"):
-        await _handle_command(chat_id, sender_id, text.lower(), agent)
+        await _handle_command(chat_id, sender_id, sender_name, text.lower(), agent)
     else:
-        reply = await agent.answer(text, user_id=sender_id)
+        await client.show_typing(chat_id)
+        reply = await agent.answer(text, user_id=sender_id, user_name=sender_name)
         await client.send_text(chat_id, reply)
 
 
 # ── Command handling ──────────────────────────────────────────────
 async def _handle_command(
-    chat_id: str, sender_id: str, command: str, agent: "WhatsAppAgent"
+    chat_id: str, sender_id: str, sender_name: str, command: str, agent: "WhatsAppAgent"
 ) -> None:
     """Handle slash commands."""
     client = get_client()
 
-    # ── Restaurant commands ───────────────────────────────────────
+    # ── Restaurant commands (available to all) ────────────────────
     if command in ("/قائمة", "/menu", "/قائمه"):
+        await client.show_typing(chat_id)
         reply = await agent.answer(
-            "اعطني القائمة الكاملة للمطعم", user_id=sender_id
+            "اعطني القائمة الكاملة للمطعم", user_id=sender_id, user_name=sender_name
         )
         await client.send_text(chat_id, reply)
 
     elif command in ("/عروض", "/offers", "/خصومات"):
+        await client.show_typing(chat_id)
         reply = await agent.answer(
-            "ما هي عروض وخصومات اليوم؟", user_id=sender_id
+            "ما هي عروض وخصومات اليوم؟", user_id=sender_id, user_name=sender_name
         )
         await client.send_text(chat_id, reply)
 
     elif command in ("/توصية", "/recommend", "/توصيه"):
+        await client.show_typing(chat_id)
         reply = await agent.answer(
-            "ما هي توصيات الشيف اليوم؟", user_id=sender_id
+            "ما هي توصيات الشيف اليوم؟", user_id=sender_id, user_name=sender_name
         )
         await client.send_text(chat_id, reply)
 
     elif command in ("/مطعم", "/info", "/معلومات"):
+        await client.show_typing(chat_id)
         reply = await agent.answer(
-            "أخبرني عن معلومات المطعم وأوقات العمل", user_id=sender_id
+            "أخبرني عن معلومات المطعم وأوقات العمل", user_id=sender_id, user_name=sender_name
         )
         await client.send_text(chat_id, reply)
 
     elif command == "/help":
         await client.send_text(chat_id, HELP_TEXT)
 
-    # ── System commands ───────────────────────────────────────────
+    # ── System commands (admin only) ──────────────────────────────
     elif command == "/status":
+        if not _is_admin(sender_id):
+            await client.send_text(chat_id, "🚫 هذا الأمر للمشرفين فقط.")
+            return
         status_text = await agent.get_status()
         await client.send_text(chat_id, status_text)
 
     elif command == "/ingest":
+        if not _is_admin(sender_id):
+            await client.send_text(chat_id, "🚫 هذا الأمر للمشرفين فقط.")
+            return
         await client.send_text(chat_id, "🔄 جارٍ إعادة فهرسة الملفات...")
         count = agent.rag_pipeline.ingest()
         if count > 0:
@@ -291,6 +431,9 @@ async def _handle_command(
             await client.send_text(chat_id, "⚠️ لا توجد ملفات PDF في المجلد.")
 
     elif command == "/sources":
+        if not _is_admin(sender_id):
+            await client.send_text(chat_id, "🚫 هذا الأمر للمشرفين فقط.")
+            return
         sources = agent.get_pdf_sources()
         if sources:
             source_list = "\n".join(f"📄 {s}" for s in sources)
@@ -323,6 +466,16 @@ async def _handle_pdf(
 
     try:
         pdf_bytes = await client.download_file(download_url)
+
+        # Enforce file size limit
+        max_size = settings.pdf_max_size_bytes
+        if len(pdf_bytes) > max_size:
+            max_mb = max_size // (1024 * 1024)
+            await client.send_text(
+                chat_id,
+                f"❌ الملف كبير جداً! الحد الأقصى {max_mb} ميغابايت.",
+            )
+            return
 
         # Save to pdfs/ directory
         pdf_dir = Path(agent.rag_pipeline.pdf_dir)

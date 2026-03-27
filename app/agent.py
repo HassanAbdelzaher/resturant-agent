@@ -2,15 +2,16 @@
 WhatsApp Agent — Central orchestrator that ties everything together.
 
 Routes incoming questions to the right data source:
-  1. PDF RAG pipeline (vector similarity search)
-  2. Database queries (conversation history, user data)
-  3. MCP tools (external systems, APIs, databases, data files)
+  1. MCP tools (restaurant menu, prices, etc.) — primary source
+  2. PDF RAG pipeline (vector similarity search on uploaded docs)
+  3. LLM fallback (conversational, personality-driven response)
 
 Uses an LLM to decide the best source and format the response.
 """
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,18 @@ from app.mcp_manager import MCPManager
 
 logger = logging.getLogger(__name__)
 
+# Restaurant working hours (24h format, matches restaurant_menu.json)
+_OPEN_HOUR = 10   # 10:00 AM
+_CLOSE_HOUR = 24  # midnight (00:00 = next day)
+
+
+def _is_restaurant_open() -> bool:
+    """Return True if the current local time is within working hours."""
+    now = datetime.now()
+    hour = now.hour
+    # 10:00 – 00:00 (midnight); midnight means hour == 0 of the next day
+    return _OPEN_HOUR <= hour or hour == 0
+
 
 def create_llm():
     """Create the LLM instance based on configuration."""
@@ -30,7 +43,7 @@ def create_llm():
         from langchain_anthropic import ChatAnthropic
 
         return ChatAnthropic(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-sonnet-4-6",
             api_key=settings.anthropic_api_key,
             max_tokens=1024,
         )
@@ -42,6 +55,26 @@ def create_llm():
             api_key=settings.openai_api_key,
             max_tokens=1024,
         )
+
+
+async def _invoke_with_retry(llm, messages, retries: int = 3, base_delay: float = 2.0):
+    """
+    Invoke an LLM with exponential-backoff retry on transient errors.
+    Raises the last exception if all retries are exhausted.
+    """
+    import asyncio
+
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return await llm.ainvoke(messages)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                logger.warning(f"LLM call failed (attempt {attempt + 1}): {exc}. Retrying in {delay}s…")
+                await asyncio.sleep(delay)
+    raise last_exc
 
 
 class WhatsAppAgent:
@@ -132,21 +165,33 @@ class WhatsAppAgent:
 
 تذكر: أنت ممثل المطعم — كل رد يجب أن يجعل الزبون يبتسم ويطلب!"""
 
+    # ── Working Hours Notice ──────────────────────────────────────
+    _CLOSED_NOTICE = (
+        "🌙 المطعم الآن مغلق! أوقات العمل: 10 صباحاً — 12 منتصف الليل.\n"
+        "يسعدنا خدمتك خلال أوقات الدوام 😊 لكن يمكنك الاستفسار عن القائمة الآن!"
+    )
+
     # ── Main Answer Pipeline ──────────────────────────────────────
-    async def answer(self, question: str, user_id: str = None) -> str:
+    async def answer(
+        self,
+        question: str,
+        user_id: str = None,
+        user_name: str = None,
+    ) -> str:
         """
         Main entry point: answer a user's question using all available sources.
 
         Pipeline:
           1. Save the user message to conversation history
           2. Get recent conversation context
-          3. Try MCP tools first (restaurant menu is the primary source)
-          4. Try PDF RAG (for any supplementary documents)
-          5. Fall back to restaurant-aware LLM response
-          6. Save the response to conversation history
+          3. Prepend a closed-restaurant notice if outside working hours
+          4. Try MCP tools first (restaurant menu is the primary source)
+          5. Try PDF RAG (for any supplementary documents)
+          6. Fall back to restaurant-aware LLM response
+          7. Save the response to conversation history
         """
         if user_id:
-            await self.db.get_or_create_user(user_id)
+            await self.db.get_or_create_user(user_id, name=user_name)
             await self.db.save_message(user_id, "user", question)
 
         history = []
@@ -156,12 +201,17 @@ class WhatsAppAgent:
         answer_text = None
         source = None
 
+        # ── Closed-restaurant notice ──────────────────────────────
+        closed_prefix = ""
+        if not _is_restaurant_open():
+            closed_prefix = self._CLOSED_NOTICE + "\n\n"
+
         # ── Try MCP Tools (Restaurant Menu is priority) ───────────
         if self.mcp.total_tools > 0:
             try:
                 tools = self.mcp.list_all_tools()
                 if tools:
-                    answer_text = await self._query_mcp(question, tools)
+                    answer_text = await self._query_mcp(question, tools, history)
                     if answer_text:
                         source = "mcp"
             except Exception as e:
@@ -170,7 +220,13 @@ class WhatsAppAgent:
         # ── Try PDF RAG (supplementary documents) ─────────────────
         if not answer_text and self.rag_pipeline.qa_chain:
             try:
-                result = await self.rag_pipeline.query(question)
+                # Augment question with recent context for better retrieval
+                contextual_q = question
+                if history:
+                    recent = " ".join(m["content"] for m in history[-2:])
+                    contextual_q = f"{recent} {question}"
+
+                result = await self.rag_pipeline.query(contextual_q)
                 answer_text = result["answer"]
                 source = "pdf"
 
@@ -200,9 +256,12 @@ class WhatsAppAgent:
                 )
             messages.append(HumanMessage(content=question))
 
-            response = await self.llm.ainvoke(messages)
+            response = await _invoke_with_retry(self.llm, messages)
             answer_text = response.content
             source = "llm"
+
+        if closed_prefix:
+            answer_text = closed_prefix + answer_text
 
         if user_id and answer_text:
             await self.db.save_message(user_id, "assistant", answer_text, source)
@@ -210,16 +269,24 @@ class WhatsAppAgent:
         return answer_text
 
     # ── MCP Tool Routing (Smart tool selection via LLM) ───────────
-    async def _query_mcp(self, question: str, tools: list[dict]) -> Optional[str]:
+    async def _query_mcp(
+        self, question: str, tools: list[dict], history: list[dict]
+    ) -> Optional[str]:
         """
         Use LLM to pick the right MCP tool and generate arguments.
-        Supports multi-step tool calls (e.g., list tables → query).
+        Conversation history is included so follow-up questions resolve correctly.
         """
         tool_descriptions = "\n".join(
             f"- {t['name']}: {t['description']}" for t in tools
         )
 
-        # Step 1: Pick the tool and generate arguments
+        # Build conversation context string for the tool selector
+        history_context = ""
+        if history:
+            history_context = "\n\nسياق المحادثة:\n" + "\n".join(
+                f"{m['role']}: {m['content']}" for m in history[-4:]
+            )
+
         messages = [
             SystemMessage(
                 content=(
@@ -238,12 +305,13 @@ class WhatsAppAgent:
                     '- سؤال عن المطعم → {{"tool": "get_restaurant_info", "arguments": {{}}}}\n'
                     '- قاعدة البيانات → {{"tool": "query", "arguments": {{"sql": "SELECT ..."}}}}\n'
                     "أخرج JSON أو NONE فقط، لا شيء آخر."
+                    f"{history_context}"
                 )
             ),
             HumanMessage(content=question),
         ]
 
-        response = await self.llm.ainvoke(messages)
+        response = await _invoke_with_retry(self.llm, messages)
         response_text = response.content.strip()
 
         if response_text == "NONE":
@@ -265,11 +333,11 @@ class WhatsAppAgent:
             tool_name = response_text.strip()
             arguments = {"query": question}
 
-        # Step 2: Call the tool via MCP manager
+        # Call the tool via MCP manager
         try:
             result = await self.mcp.call_tool(tool_name, arguments)
 
-            # Step 3: Summarize the result for WhatsApp
+            # Summarize the result for WhatsApp
             summary = await self._summarize_for_whatsapp(question, tool_name, result)
             return summary
 
@@ -309,7 +377,7 @@ class WhatsAppAgent:
             ),
         ]
 
-        response = await self.llm.ainvoke(messages)
+        response = await _invoke_with_retry(self.llm, messages)
         return response.content
 
     # ── Status & Utility ──────────────────────────────────────────
@@ -317,6 +385,7 @@ class WhatsAppAgent:
         """Get a formatted status message."""
         stats = await self.db.get_stats()
         rag_status = "✅ Active" if self.rag_pipeline.qa_chain else "❌ No PDFs"
+        open_status = "✅ مفتوح" if _is_restaurant_open() else "🌙 مغلق"
 
         # MCP status details
         mcp_status_parts = []
@@ -329,6 +398,7 @@ class WhatsAppAgent:
 
         return (
             f"*System Status*\n\n"
+            f"🍽️ المطعم: {open_status}\n"
             f"📚 PDF RAG: {rag_status}\n"
             f"🗄️ Database: ✅ Active\n"
             f"🔌 MCP Servers:\n{mcp_text}\n\n"
