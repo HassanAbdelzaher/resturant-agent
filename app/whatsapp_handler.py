@@ -18,7 +18,6 @@ GreenAPI REST API:
 
 import asyncio
 import logging
-import tempfile
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -28,6 +27,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 
 from app.config import settings
+from app.cart import cart_manager
 
 if TYPE_CHECKING:
     from app.agent import WhatsAppAgent
@@ -50,11 +50,19 @@ _عندنا الأكل حلو والنكتة أحلى!_
 • أبي شيء نباتي
 • وصف طبق المندي
 
-*الأوامر المتاحة:*
+*📋 أوامر الاستعلام:*
 /قائمة — عرض قائمة الطعام كاملة
 /عروض — عروض وخصومات اليوم
 /توصية — اختيار الشيف اليوم
 /مطعم — معلومات المطعم والتوصيل
+
+*🛒 أوامر الطلب:*
+/طلب [اسم الطبق] — إضافة طبق للسلة
+/سلة — عرض سلتك الحالية
+/تأكيد — تأكيد وإرسال الطلب
+/إلغاء — إلغاء وتفريغ السلة
+/طلباتي — عرض طلباتك السابقة
+
 /help — عرض هذه الرسالة
 
 _ملاحظة: لا تتردد في السؤال — الجوع لا ينتظر!_ 😄"""
@@ -441,12 +449,137 @@ async def _handle_command(
         else:
             await client.send_text(chat_id, "لا توجد ملفات مفهرسة بعد.")
 
+    # ── Order commands (available to all) ────────────────────────
+    elif command == "/سلة" or command == "/cart":
+        await client.send_text(chat_id, cart_manager.format_cart(sender_id))
+
+    elif command.startswith("/طلب") or command.startswith("/order"):
+        # /طلب <dish name>
+        parts = command.split(maxsplit=1)
+        dish_query = parts[1].strip() if len(parts) > 1 else ""
+        if not dish_query:
+            await client.send_text(
+                chat_id,
+                "✍️ اكتب اسم الطبق بعد الأمر، مثلاً:\n/طلب كبسة\n/طلب كنافة",
+            )
+            return
+        dish = cart_manager.find_dish(dish_query)
+        if not dish:
+            await client.send_text(
+                chat_id,
+                f"❓ ما لقيت طبق باسم *{dish_query}*\n\n"
+                "جرب /قائمة لتشوف الأصناف المتاحة.",
+            )
+            return
+        currency = cart_manager.get_currency()
+        cart_manager.add_item(
+            sender_id, dish["id"], dish["name"], float(dish["price"])
+        )
+        total = cart_manager.get_total(sender_id)
+        await client.send_text(
+            chat_id,
+            f"✅ تمت الإضافة!\n"
+            f"{dish.get('emoji','🍽️')} *{dish['name']}* — {dish['price']} {currency}\n\n"
+            f"💰 إجمالي سلتك: *{total:.0f} {currency}*\n\n"
+            "اكتب /سلة لعرض سلتك أو /تأكيد لإتمام الطلب.",
+        )
+
+    elif command in ("/تأكيد", "/confirm", "/checkout"):
+        await _confirm_order(chat_id, sender_id, sender_name, agent)
+
+    elif command in ("/إلغاء", "/cancel", "/الغاء"):
+        if cart_manager.is_empty(sender_id):
+            await client.send_text(chat_id, "🛒 سلتك فارغة أصلاً! لا يوجد شيء للإلغاء.")
+        else:
+            cart_manager.clear(sender_id)
+            await client.send_text(
+                chat_id,
+                "❌ تم إلغاء طلبك وتفريغ السلة.\n\n"
+                "عندما تكون جاهزاً، استخدم /قائمة لتبدأ من جديد 🍽️",
+            )
+
+    elif command in ("/طلباتي", "/orders", "/myorders"):
+        orders = await agent.db.get_user_orders(sender_id, limit=5)
+        if not orders:
+            await client.send_text(chat_id, "📋 ليس لديك طلبات سابقة بعد.\n\nابدأ بـ /قائمة!")
+        else:
+            currency = cart_manager.get_currency()
+            lines = ["📋 *آخر طلباتك:*", ""]
+            for order in orders:
+                status_icon = "✅" if order.status == "confirmed" else "❌"
+                lines.append(
+                    f"{status_icon} طلب #{order.id} — "
+                    f"*{order.total:.0f} {currency}* — "
+                    f"{order.created_at.strftime('%Y/%m/%d %H:%M')}"
+                )
+            await client.send_text(chat_id, "\n".join(lines))
+
     else:
         await client.send_text(
             chat_id,
             f"❓ أمر غير معروف: {command}\n\n"
             "اكتب /help لرؤية الأوامر المتاحة 😄",
         )
+
+
+# ── Order confirmation ────────────────────────────────────────────
+async def _confirm_order(
+    chat_id: str, sender_id: str, sender_name: str, agent: "WhatsAppAgent"
+) -> None:
+    """Validate, save, and notify staff about a confirmed order."""
+    client = get_client()
+
+    if cart_manager.is_empty(sender_id):
+        await client.send_text(
+            chat_id,
+            "🛒 سلتك فارغة! أضف أطباقاً أولاً بـ /طلب <اسم الطبق>",
+        )
+        return
+
+    total = cart_manager.get_total(sender_id)
+    min_order = cart_manager.get_min_order()
+    currency = cart_manager.get_currency()
+
+    if total < min_order:
+        remaining = min_order - total
+        await client.send_text(
+            chat_id,
+            f"⚠️ الحد الأدنى للطلب {min_order:.0f} {currency}.\n"
+            f"سلتك الحالية {total:.0f} {currency} — أضف {remaining:.0f} {currency} أكثر.",
+        )
+        return
+
+    # Save order to DB
+    items = cart_manager.get_items(sender_id)
+    order = await agent.db.place_order(
+        wa_id=sender_id,
+        items=items,
+        total=total,
+        user_name=sender_name or None,
+    )
+
+    # Notify user
+    await client.send_text(
+        chat_id,
+        f"🎉 *تم تأكيد طلبك!*\n\n"
+        f"رقم طلبك: *#{order.id}*\n"
+        f"💰 الإجمالي: *{total:.0f} {currency}*\n"
+        f"🚚 وقت التوصيل المتوقع: 30-45 دقيقة\n\n"
+        "شكراً لك! سيتم تحضير طلبك الآن. 😄🍽️",
+    )
+
+    # Notify staff (if configured)
+    staff_id = settings.staff_wa_id.strip()
+    if staff_id:
+        staff_chat_id = f"{staff_id}@c.us"
+        staff_msg = cart_manager.format_order_for_staff(sender_id, order.id, sender_name)
+        try:
+            await client.send_text(staff_chat_id, staff_msg)
+        except Exception as exc:
+            logger.error(f"Failed to notify staff ({staff_id}): {exc}")
+
+    # Clear cart after successful order
+    cart_manager.clear(sender_id)
 
 
 # ── PDF upload handling ───────────────────────────────────────────

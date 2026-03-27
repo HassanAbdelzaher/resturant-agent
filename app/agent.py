@@ -11,6 +11,7 @@ Uses an LLM to decide the best source and format the response.
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,12 @@ logger = logging.getLogger(__name__)
 _OPEN_HOUR = 10   # 10:00 AM
 _CLOSE_HOUR = 24  # midnight (00:00 = next day)
 
+# Order-intent keywords (Arabic + English)
+_ORDER_INTENT_RE = re.compile(
+    r"\b(أضف|اضف|أطلب|اطلب|عايز|أبي|أبغى|أريد|حط|ضيف|order|add|i want|i'd like)\b",
+    re.IGNORECASE,
+)
+
 
 def _is_restaurant_open() -> bool:
     """Return True if the current local time is within working hours."""
@@ -35,6 +42,15 @@ def _is_restaurant_open() -> bool:
     hour = now.hour
     # 10:00 – 00:00 (midnight); midnight means hour == 0 of the next day
     return _OPEN_HOUR <= hour or hour == 0
+
+
+def _detect_language(text: str) -> str:
+    """Return 'en' if the message is predominantly English, else 'ar'."""
+    ascii_letters = sum(1 for c in text if c.isascii() and c.isalpha())
+    total_letters = sum(1 for c in text if c.isalpha())
+    if total_letters == 0:
+        return "ar"
+    return "en" if ascii_letters / total_letters > 0.6 else "ar"
 
 
 def create_llm():
@@ -139,7 +155,7 @@ class WhatsAppAgent:
 
 شخصيتك:
 - نادل ودود وظريف يحب الفكاهة العربية الأصيلة
-- تتكلم بالعربية الفصحى المحكية بدفء وحيوية
+- تتكلم بنفس لغة الزبون: إذا كتب بالعربية رد بالعربية، إذا كتب بالإنجليزية رد بالإنجليزية
 - دائماً تُدخل البهجة على قلب الزبون قبل الطعام على معدته
 - تستخدم الإيموجي بذكاء لكن بدون إسراف
 - ردودك قصيرة ومضحكة ومفيدة — مثل النادل الماهر تماماً
@@ -155,11 +171,18 @@ class WhatsAppAgent:
 - إذا سأل الزبون عن طبق → اعطه السعر + وصف + حقيقة ظريفة
 - إذا طلب توصية → اسأله: نباتي؟ حار؟ عائلة؟ → ثم قدّم الأنسب
 - إذا سأل عن العرض → أخبره بعرض اليوم مع نكتة خفيفة
+- إذا أراد الزبون طلب طبق → أخبره يستخدم: /طلب [اسم الطبق]
 - دائماً اختم ردك بجملة تشجع على الطلب أو تُضحك
 - لا تُطوّل — الزبون جائع وعنده صبر محدود!
 
+أوامر الطلب للزبائن:
+/طلب [اسم الطبق] — إضافة طبق للسلة
+/سلة — عرض السلة الحالية
+/تأكيد — تأكيد وإرسال الطلب
+/إلغاء — إلغاء الطلب
+
 أمثلة على نبرتك:
-- "هذه الكبسة تجعل الجيران يطرقون بابك!"
+- "هذه الكبسة تجعل الجيران يطرقون بابك! جرب: /طلب كبسة"
 - "الكنافة موجودة — وضميرك عليك أنت!"
 - "الشيف يقول السر في الكمية... نحن نقول السر في الجوع!"
 
@@ -200,6 +223,37 @@ class WhatsAppAgent:
 
         answer_text = None
         source = None
+
+        # ── Order intent shortcut ─────────────────────────────────
+        # If the user says "أبي كبسة" or "add chicken kabsa", guide them
+        # to the /طلب command rather than just showing dish info.
+        if _ORDER_INTENT_RE.search(question):
+            from app.cart import cart_manager
+            lang = _detect_language(question)
+            # Try to find the dish they mentioned
+            # Strip ordering keywords to get just the dish name
+            dish_query = _ORDER_INTENT_RE.sub("", question).strip(" ،,")
+            dish = cart_manager.find_dish(dish_query) if dish_query else None
+            if dish:
+                currency = cart_manager.get_currency()
+                if lang == "en":
+                    hint = (
+                        f"Great choice! 😄\n"
+                        f"{dish.get('emoji','🍽️')} *{dish.get('name_en', dish['name'])}* "
+                        f"— {dish['price']} {currency}\n\n"
+                        f"To add it to your cart, type:\n"
+                        f"*/order {dish['name']}*"
+                    )
+                else:
+                    hint = (
+                        f"اختيار ممتاز! 😄\n"
+                        f"{dish.get('emoji','🍽️')} *{dish['name']}* — {dish['price']} {currency}\n\n"
+                        f"لإضافته لسلتك، اكتب:\n"
+                        f"*/طلب {dish['name']}*"
+                    )
+                if user_id:
+                    await self.db.save_message(user_id, "assistant", hint, "order_hint")
+                return hint
 
         # ── Closed-restaurant notice ──────────────────────────────
         closed_prefix = ""

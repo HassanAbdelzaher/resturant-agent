@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     app_port: int = 8000
     debug: bool = True
 
+    # ── Order Management ──────────────────────────────────────────
+    # WhatsApp ID to send new order notifications to (e.g. "966501234567")
+    staff_wa_id: str = ""
+
     # ── Security & Rate Limiting ───────────────────────────────────
     # Comma-separated WhatsApp IDs allowed to run system commands
     # e.g. "966501234567,966509876543"

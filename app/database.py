@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import String, Text, DateTime, Integer, select, func
+from sqlalchemy import String, Text, DateTime, Integer, Float, select, func
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -65,6 +65,36 @@ class Conversation(Base):
     source: Mapped[Optional[str]] = mapped_column(
         String(50), nullable=True
     )  # "pdf", "db", "mcp"
+
+
+class Order(Base):
+    """A customer order placed via WhatsApp."""
+
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wa_id: Mapped[str] = mapped_column(String(50), index=True)
+    user_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending / confirmed / cancelled
+    total: Mapped[float] = mapped_column(Float, default=0.0)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class OrderItem(Base):
+    """A single dish line inside an Order."""
+
+    __tablename__ = "order_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(Integer, index=True)
+    dish_id: Mapped[str] = mapped_column(String(50))
+    dish_name: Mapped[str] = mapped_column(String(200))
+    price: Mapped[float] = mapped_column(Float)
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    subtotal: Mapped[float] = mapped_column(Float)
 
 
 class Document(Base):
@@ -183,6 +213,54 @@ class DatabaseManager:
                 "messages": msg_count or 0,
                 "documents": doc_count or 0,
             }
+
+    # ── Order Management ───────────────────────────────────────────
+    async def place_order(
+        self,
+        wa_id: str,
+        items: list,  # list[CartItem]
+        total: float,
+        user_name: str = None,
+        notes: str = None,
+    ) -> "Order":
+        """Persist a confirmed order and its items. Returns the saved Order."""
+        async with self.async_session() as session:
+            order = Order(
+                wa_id=wa_id,
+                user_name=user_name,
+                total=total,
+                notes=notes,
+                status="confirmed",
+            )
+            session.add(order)
+            await session.flush()  # get order.id before inserting items
+
+            for item in items:
+                session.add(
+                    OrderItem(
+                        order_id=order.id,
+                        dish_id=item.dish_id,
+                        dish_name=item.name,
+                        price=item.price,
+                        quantity=item.quantity,
+                        subtotal=item.subtotal,
+                    )
+                )
+
+            await session.commit()
+            await session.refresh(order)
+            return order
+
+    async def get_user_orders(self, wa_id: str, limit: int = 5) -> list:
+        """Return the most recent orders for a user."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(Order)
+                .where(Order.wa_id == wa_id)
+                .order_by(Order.created_at.desc())
+                .limit(limit)
+            )
+            return result.scalars().all()
 
     # ── Natural Language SQL Query (for agent use) ─────────────────
     async def execute_raw_query(self, query: str) -> list[dict]:
