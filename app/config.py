@@ -39,9 +39,25 @@ class Settings(BaseSettings):
     app_port: int = 8000
     debug: bool = True
 
+    # ── Security & Rate Limiting ───────────────────────────────────
+    # Comma-separated WhatsApp IDs allowed to run system commands
+    # e.g. "966501234567,966509876543"
+    admin_wa_ids: str = ""
+    # Max messages per user per minute (0 = unlimited)
+    rate_limit_per_minute: int = 20
+    # Max PDF upload size in bytes (default 10 MB)
+    pdf_max_size_bytes: int = 10 * 1024 * 1024
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+    @property
+    def admin_ids_set(self) -> set[str]:
+        """Return admin IDs as a set for fast lookup."""
+        if not self.admin_wa_ids:
+            return set()
+        return {uid.strip() for uid in self.admin_wa_ids.split(",") if uid.strip()}
 
 
 settings = Settings()

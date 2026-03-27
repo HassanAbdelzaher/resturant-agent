@@ -187,14 +187,38 @@ class DatabaseManager:
     # ── Natural Language SQL Query (for agent use) ─────────────────
     async def execute_raw_query(self, query: str) -> list[dict]:
         """
-        Execute a raw SQL query (SELECT only, for safety).
+        Execute a read-only SQL query (SELECT only, for safety).
         Used by the agent to answer data questions.
+
+        Validates that the statement is a plain SELECT with no stacked
+        statements, sub-commands, or DDL/DML keywords.
         """
-        if not query.strip().upper().startswith("SELECT"):
-            raise ValueError("Only SELECT queries are allowed for safety.")
+        from sqlalchemy import text as sa_text
+        import re
+
+        normalized = query.strip()
+
+        # Must start with SELECT
+        if not normalized.upper().startswith("SELECT"):
+            raise ValueError("Only SELECT queries are allowed.")
+
+        # Block stacked statements and dangerous keywords
+        _BLOCKED = re.compile(
+            r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|EXEC|EXECUTE"
+            r"|GRANT|REVOKE|ATTACH|DETACH|PRAGMA)\b",
+            re.IGNORECASE,
+        )
+        if _BLOCKED.search(normalized):
+            raise ValueError("Query contains disallowed SQL keywords.")
+
+        # Block multiple statements (simple semicolon check)
+        # Allow semicolon only as the very last character (optional terminator)
+        core = normalized.rstrip(";").rstrip()
+        if ";" in core:
+            raise ValueError("Multiple statements are not allowed.")
 
         async with self.async_session() as session:
-            result = await session.execute(query)
+            result = await session.execute(sa_text(normalized))
             rows = result.fetchall()
-            columns = result.keys()
+            columns = list(result.keys())
             return [dict(zip(columns, row)) for row in rows]
