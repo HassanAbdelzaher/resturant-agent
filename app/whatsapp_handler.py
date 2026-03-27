@@ -38,6 +38,23 @@ logger = logging.getLogger(__name__)
 _WA_MAX_CHARS = 4096
 
 # ── Texts ─────────────────────────────────────────────────────────
+def _build_welcome(name: str = "") -> str:
+    """Build a personalised first-contact welcome message."""
+    greeting = f"أهلاً *{name}*" if name else "أهلاً وسهلاً"
+    return (
+        f"🎉 {greeting}! مرحباً بك في *مطعم أبو طبق* 🍽️\n"
+        "_عندنا الأكل حلو والنكتة أحلى!_\n\n"
+        "أنا *أبو طبق*، مساعدك الذكي — اسألني عن أي شيء:\n"
+        "• قائمة الطعام والأسعار\n"
+        "• توصيات الشيف\n"
+        "• عروض اليوم\n"
+        "• تفاصيل أي طبق (مكونات، سعرات، حساسية...)\n\n"
+        "🛒 *لطلب الطعام:*\n"
+        "اكتب */طلب [اسم الطبق]* — مثلاً: /طلب كبسة\n\n"
+        "اكتب */help* لرؤية كل الأوامر المتاحة 😄"
+    )
+
+
 HELP_TEXT = """🍽️ *أهلاً في مطعم أبو طبق!*
 _عندنا الأكل حلو والنكتة أحلى!_
 
@@ -370,6 +387,11 @@ async def _dispatch_text(
             "⏳ أنت تراسلنا كثيراً! انتظر لحظة ثم حاول مرة أخرى 😅",
         )
         return
+
+    # Welcome new users on their very first message
+    _, is_new = await agent.db.get_or_create_user(sender_id, name=sender_name)
+    if is_new:
+        await client.send_text(chat_id, _build_welcome(sender_name))
 
     if text.startswith("/"):
         await _handle_command(chat_id, sender_id, sender_name, text.lower(), agent)

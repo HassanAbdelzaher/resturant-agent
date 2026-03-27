@@ -131,22 +131,32 @@ class DatabaseManager:
         await self.engine.dispose()
 
     # ── User Operations ────────────────────────────────────────────
-    async def get_or_create_user(self, wa_id: str, name: str = None) -> User:
-        """Get existing user or create a new one."""
+    async def get_or_create_user(
+        self, wa_id: str, name: str = None
+    ) -> tuple["User", bool]:
+        """
+        Get existing user or create a new one.
+
+        Returns:
+            (user, is_new) — is_new is True the very first time this wa_id is seen.
+        """
         async with self.async_session() as session:
             result = await session.execute(select(User).where(User.wa_id == wa_id))
             user = result.scalar_one_or_none()
+            is_new = user is None
 
-            if not user:
+            if is_new:
                 user = User(wa_id=wa_id, name=name)
                 session.add(user)
             else:
                 user.last_active = datetime.now(timezone.utc)
                 user.message_count += 1
+                if name and not user.name:
+                    user.name = name
 
             await session.commit()
             await session.refresh(user)
-            return user
+            return user, is_new
 
     # ── Conversation History ───────────────────────────────────────
     async def save_message(

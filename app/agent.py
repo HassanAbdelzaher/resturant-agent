@@ -217,6 +217,7 @@ class WhatsAppAgent:
             await self.db.get_or_create_user(user_id, name=user_name)
             await self.db.save_message(user_id, "user", question)
 
+
         history = []
         if user_id:
             history = await self.db.get_conversation_history(user_id, limit=6)
